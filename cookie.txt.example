@@ -1,0 +1,3 @@
+# 复制本文件为 cookie.txt，把下面这行替换成你自己的 JSESSIONID（浏览器 F12 → Application → Cookies）
+# 脚本也接受： --cookie "JSESSIONID=xxxx"
+JSESSIONID=在这里粘贴你的会话ID
