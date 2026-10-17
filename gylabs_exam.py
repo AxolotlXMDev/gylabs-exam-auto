@@ -82,6 +82,10 @@ class Session:
         self.cookies = {}
         self.path = cookie_jar
         self._lock = threading.Lock()
+        # 站点的部分入口会校验 Referer；同时保留最终响应 URL，
+        # 这样列表页 → 确认页 → 试卷页的请求链与浏览器一致。
+        self.last_url = None
+        self.last_html = ""
         if cookie_header:
             for part in cookie_header.split(";"):
                 if "=" in part:
@@ -100,11 +104,21 @@ class Session:
 
     def absorb(self, headers):
         with self._lock:
-            for raw in headers.get_all("Set-Cookie") or []:
+            all_headers = []
+            for name in ("Set-Cookie", "Set-Cookie2"):
+                all_headers.extend(headers.get_all(name) or [])
+            for raw in all_headers:
                 first = raw.split(";")[0].strip()
                 if "=" in first:
                     k, v = first.split("=", 1)
-                    self.cookies[k.strip()] = v.strip()
+                    k, v = k.strip(), v.strip()
+                    if not k:
+                        continue
+                    # 服务器用空值/Max-Age=0 清理 Cookie 时同步删除本地值。
+                    if not v or re.search(r"(?:^|;)\s*max-age\s*=\s*0(?:;|$)", raw, re.I):
+                        self.cookies.pop(k, None)
+                    else:
+                        self.cookies[k] = v
 
     def save(self):
         if not self.path:
@@ -118,6 +132,46 @@ def make_opener(cookie_jar=None, cookie_header=None):
     return Session(cookie_jar, cookie_header)
 
 
+class _SessionRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """在 urllib 自动跟随 30x 时也保存中间响应下发的 Cookie。"""
+
+    def __init__(self, session):
+        super().__init__()
+        self.session = session
+
+    def _save(self, headers):
+        self.session.absorb(headers)
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None:
+            # 将刚从 30x 响应中收到的路由/会话 Cookie 带到下一跳。
+            if self.session.cookies:
+                redirected.headers["Cookie"] = self.session.header()
+            redirected.headers["Referer"] = req.full_url
+        return redirected
+
+    def http_error_301(self, req, fp, code, msg, headers):
+        self._save(headers)
+        return super().http_error_301(req, fp, code, msg, headers)
+
+    def http_error_302(self, req, fp, code, msg, headers):
+        self._save(headers)
+        return super().http_error_302(req, fp, code, msg, headers)
+
+    def http_error_303(self, req, fp, code, msg, headers):
+        self._save(headers)
+        return super().http_error_303(req, fp, code, msg, headers)
+
+    def http_error_307(self, req, fp, code, msg, headers):
+        self._save(headers)
+        return super().http_error_307(req, fp, code, msg, headers)
+
+    def http_error_308(self, req, fp, code, msg, headers):
+        self._save(headers)
+        return super().http_error_308(req, fp, code, msg, headers)
+
+
 def _request(session, url, data=None, tries=3):
     if isinstance(data, (dict, list)):
         body = urllib.parse.urlencode(data).encode()
@@ -127,19 +181,27 @@ def _request(session, url, data=None, tries=3):
     for i in range(tries):
         try:
             _pace()
-            headers = {"User-Agent": UA, "Referer": BASE + "/"}
+            headers = {"User-Agent": UA,
+                       "Referer": session.last_url or BASE + "/",
+                       "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"}
             if session.cookies:
                 headers["Cookie"] = session.header()
             req = urllib.request.Request(url, data=body, headers=headers)
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            opener = urllib.request.build_opener(_SessionRedirectHandler(session))
+            with opener.open(req, timeout=30) as resp:
                 raw = resp.read()
                 session.absorb(resp.headers)
+                session.last_url = resp.geturl()
             for enc in ("utf-8", "gb18030"):
                 try:
-                    return raw.decode(enc)
+                    text = raw.decode(enc)
+                    session.last_html = text
+                    return text
                 except UnicodeDecodeError:
                     continue
-            return raw.decode("utf-8", "replace")
+            text = raw.decode("utf-8", "replace")
+            session.last_html = text
+            return text
         except Exception as exc:  # noqa: BLE001
             last = exc
             if i < tries - 1:
@@ -166,13 +228,17 @@ def get_bytes(session, url, tries=3):
     for i in range(tries):
         try:
             _pace()
-            headers = {"User-Agent": UA, "Referer": BASE + "/"}
+            headers = {"User-Agent": UA,
+                       "Referer": session.last_url or BASE + "/",
+                       "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"}
             if session.cookies:
                 headers["Cookie"] = session.header()
             req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            opener = urllib.request.build_opener(_SessionRedirectHandler(session))
+            with opener.open(req, timeout=30) as resp:
                 data = resp.read()
                 session.absorb(resp.headers)
+                session.last_url = resp.geturl()
             return data
         except Exception as exc:  # noqa: BLE001
             last = exc
@@ -180,11 +246,24 @@ def get_bytes(session, url, tries=3):
     raise RuntimeError("下载失败 %s: %s" % (url, last))
 
 
+def login_expired(html):
+    """识别站点返回的统一登录失效页。"""
+    text = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html or "", flags=re.I | re.S)
+    text = re.sub(r"\s+", " ", clean_block(text))
+    markers = (
+        "登录已经失效", "登录已失效", "登录超时", "登录提示",
+        "立即重新登录", "账号在其他地方登录", "一个账号只能登录一次",
+    )
+    return any(marker in text for marker in markers)
+
+
 def whoami(session):
     """返回已登录用户名；未登录/失效返回 None。"""
     try:
         html = get(session, BASE + "/userOperation.do?ms=afterLogin", tries=1)
     except Exception:  # noqa: BLE001
+        return None
+    if login_expired(html):
         return None
     if "您好" not in html:
         return None
@@ -199,8 +278,8 @@ def require_login(session, cookie_hint):
         print("已登录：%s" % name)
         return True
     print("!! Cookie 无效或已过期，无法登录系统。")
-    print("   请先用浏览器登录 https://gylabs.gdupt.edu.cn/ ，")
-    print("   F12 → Application → Cookies → 复制 JSESSIONID，写进 %s（内容形如 JSESSIONID=xxxx）。" % cookie_hint)
+    print("   该站一个账号只能保留一个会话；浏览器重新登录/点击考试可能会把旧 Cookie 踢下线。")
+    print("   请在当前仍登录的浏览器会话中复制最新 Cookie，写进 %s（内容形如 JSESSIONID=xxxx）。" % cookie_hint)
     print("   或改用： --cookie \"JSESSIONID=xxxx\"")
     return False
 
@@ -208,7 +287,12 @@ def require_login(session, cookie_hint):
 # --------------------------------------------------------------------------- parsing
 
 def attrs(tag):
-    return {k.lower(): v for k, v in re.findall(r'([\w:-]+)\s*=\s*"([^"]*)"', tag)}
+    """解析 HTML 标签属性，兼容双引号、单引号和未加引号的值。"""
+    out = {}
+    pattern = r'''([\w:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))'''
+    for m in re.finditer(pattern, tag):
+        out[m.group(1).lower()] = next(value for value in m.groups()[1:] if value is not None)
+    return out
 
 
 def clean_label(text):
@@ -227,6 +311,134 @@ def parse_hidden(html):
         if a.get("type", "").lower() == "hidden" and a.get("name"):
             out[a["name"]] = a.get("value", "")
     return out
+
+
+FORM_RE = re.compile(r'<form\b([^>]*)>(.*?)</form\s*>', re.I | re.S)
+BUTTON_RE = re.compile(r'<button\b([^>]*)>(.*?)</button\s*>', re.I | re.S)
+
+
+def _paper_page(html):
+    """判断响应是否已经是可答题的试卷页。"""
+    return "exameform" in html.lower() and bool(question_md5(html))
+
+
+def _control_label(tag, body=""):
+    """取按钮/提交控件上显示给用户的文字。"""
+    a = attrs(tag)
+    return clean_label(a.get("value", "") or body)
+
+
+def _confirmation_label(text):
+    """返回文本是否像“确认进入考试”按钮。"""
+    text = clean_label(text).lower()
+    if not text:
+        return False
+    if re.search(r"取消|返回|退出|否|cancel|no\b", text, re.I):
+        return False
+    return bool(re.search(r"确认|确定|进入|开始|继续|同意|是|confirm|sure|start|continue|yes\b", text, re.I))
+
+
+def _confirmation_request(html, exameid, current_url):
+    """从进入考试的确认页提取下一次请求。
+
+    不同考试配置生成的确认页并不完全相同：有的用 form 提交，有的用
+    ``location.href``，还有的只放一个带“确定/进入”文字的链接。这里仅
+    跟随明确指向考试 action 的确认控件，避免把普通错误页再次提交。
+    返回 ``(method, url, data)``，找不到确认控件时返回 ``None``。
+    """
+    exam_id = str(exameid)
+
+    def target_url(action, ensure_exam_id=True):
+        if not action or action.lower().startswith("javascript:"):
+            return None
+        url = urllib.parse.urljoin(current_url, action)
+        parsed = urllib.parse.urlsplit(url)
+        if "studentExameAction.do" not in parsed.path:
+            return None
+        # 某些确认页的 action 没带考试 id，沿用当前命令的 id。
+        if ensure_exam_id and "exameid=" not in parsed.query.lower():
+            sep = "&" if parsed.query else "?"
+            url += sep + urllib.parse.urlencode({"exameid": exam_id})
+        return url
+
+    def form_pairs(body, submit_tag=None):
+        pairs = []
+        for tag in INPUT_TAG_RE.findall(body):
+            a = attrs(tag)
+            name = a.get("name")
+            typ = a.get("type", "text").lower()
+            if not name or typ in ("button", "reset", "file", "image", "submit"):
+                continue
+            if typ in ("checkbox", "radio") and "checked" not in tag.lower():
+                continue
+            pairs.append((name, a.get("value", "")))
+        if submit_tag is not None:
+            a = attrs(submit_tag)
+            if a.get("name"):
+                pairs.append((a["name"], a.get("value", "")))
+        return pairs
+
+    # 优先处理 form。只自动提交带明确确认文字的 submit/button，避免误点“取消”。
+    for form_attrs, body in FORM_RE.findall(html):
+        form_action = attrs(form_attrs).get("action", "")
+        controls = []
+        for tag in INPUT_TAG_RE.findall(body):
+            a = attrs(tag)
+            typ = a.get("type", "").lower()
+            onclick = a.get("onclick", "").lower()
+            if typ == "submit" or (typ == "button" and _confirmation_label(a.get("value", ""))
+                                    and (form_action or re.search(
+                                        r"submit|location|goto|enter|start|begin|confirm|sure",
+                                        onclick))):
+                controls.append((tag, ""))
+        controls.extend((tag, inner) for tag, inner in BUTTON_RE.findall(body)
+                        if attrs(tag).get("type", "submit").lower() not in ("button", "reset")
+                        or (attrs(tag).get("type", "").lower() == "button"
+                            and _confirmation_label(_control_label(tag, inner))
+                            and (form_action or re.search(
+                                r"submit|location|goto|enter|start|begin|confirm|sure",
+                                attrs(tag).get("onclick", "").lower()))))
+        selected = next(((tag, inner) for tag, inner in controls
+                         if _confirmation_label(_control_label(tag, inner))), None)
+        form_text = clean_label(body)
+        if selected is None and len(controls) == 1 and _confirmation_label(form_text):
+            selected = controls[0]
+        if selected is None:
+            continue
+        action = form_action
+        # 表单通常把 exameid 放在 hidden input 中。该站点的 gotoExame
+        # 对“URL 查询串 + POST 同名字段”的组合会误回登录失效页，
+        # 所以保留 action 原样，只通过表单字段传 exam id。
+        url = target_url(action, ensure_exam_id=False) if action else target_url(current_url)
+        if not url:
+            continue
+        submit_tag, _ = selected
+        pairs = form_pairs(body, submit_tag)
+        query = urllib.parse.urlsplit(url).query.lower()
+        if (not any(k.lower() in ("exameid", "examid") for k, _ in pairs)
+                and "exameid=" not in query and "examid=" not in query):
+            pairs.append(("exameid", exam_id))
+        method = attrs(form_attrs).get("method", "post").lower()
+        return method, url, pairs
+
+    # 其次处理确认链接或 onclick/location 跳转。
+    link_re = re.compile(r'<a\b([^>]*)>(.*?)</a\s*>', re.I | re.S)
+    for link_attrs, body in link_re.findall(html):
+        if not _confirmation_label(body):
+            continue
+        url = target_url(attrs(link_attrs).get("href", ""))
+        if url:
+            return "get", url, None
+
+    # 老页面常把确认写成 JavaScript 的 location.href/location.replace。
+    js_re = re.compile(
+        r'''(?:location(?:\.href)?|window\.location(?:\.href)?|location\.replace)\s*\(?(?:\s*=\s*)?['"]([^'"]+)['"]''',
+        re.I)
+    for action in js_re.findall(html):
+        url = target_url(action)
+        if url:
+            return "get", url, None
+    return None
 
 
 def question_md5(html):
@@ -421,9 +633,30 @@ def bank_resolve(bank, page):
 # --------------------------------------------------------------------------- flows
 
 def fetch_paper_page(opener, exameid):
-    """进入考试/自测，返回第 1 页 HTML。"""
+    """进入考试/自测，返回第 1 页 HTML。
+
+    部分考试在真正的试卷页前增加“确认进入考试”页。浏览器会自动按该
+    页的 form/链接/脚本继续请求，纯 HTTP 请求也需要复现这一步；否则
+    ``do_exam`` 会把确认页误报成“没有考试权限”。
+    """
     url = "%s?ms=beforeGotoExame&exameid=%s&TimeStemp=%f" % (EXAM_ACTION, exameid, random.random())
-    return get(opener, url)
+    html = get(opener, url)
+    for _ in range(3):
+        if _paper_page(html):
+            return html
+        request = _confirmation_request(html, exameid, url)
+        if not request:
+            return html
+        method, next_url, data = request
+        if method == "get":
+            if data:
+                query = urllib.parse.urlencode(data, doseq=True)
+                next_url += ("&" if "?" in next_url else "?") + query
+            html = get(opener, next_url)
+        else:
+            html = post(opener, next_url, data)
+        url = next_url
+    return html
 
 
 def save_and_next(opener, html, page, letters, next_page, tries=3):
@@ -448,6 +681,11 @@ def submit_paper(opener, html, page, letters):
 
 def do_exam(opener, bank, exameid, dry_run=False, max_pages=100):
     html = fetch_paper_page(opener, exameid)
+    if login_expired(html):
+        raise RuntimeError(
+            "进入考试时当前会话已失效（通常是浏览器/其他脚本重新登录后把此 Cookie 踢下线）。\n"
+            "    请从当前仍登录的浏览器会话重新复制 Cookie，再重试；列表页曾成功不代表考试入口仍使用同一会话。"
+        )
     if "exameform" not in html or not parse_page(html)["md5"]:
         raise RuntimeError("进不去这场考试，服务端返回的不是试卷页。\n    服务端提示：%s\n"
                            "    （常见原因：不在该考试的考生范围内 / 次数用尽 / 考试已结束；"
@@ -455,6 +693,9 @@ def do_exam(opener, bank, exameid, dry_run=False, max_pages=100):
     unknown = []
     for p in range(1, max_pages + 1):
         page = parse_page(html)
+        if p > 1 and not page["md5"]:
+            print("  试卷已到末页，停止继续请求。")
+            break
         if page["page"] and page["page"] != p:
             print("  [警告] 期望第 %d 页，服务器返回第 %s 页" % (p, page["page"]))
         letters = bank_resolve(bank, page)

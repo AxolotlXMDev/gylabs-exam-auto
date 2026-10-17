@@ -35,7 +35,7 @@
 | 登录（第二步） | `POST /j_spring_security_check` | Spring Security 真正的鉴权：`j_username`、`j_password`、`checkcodeuser` |
 | 登录校验 | `GET /userOperation.do?ms=afterLogin` | 返回 HTML 含「您好」即成功 |
 | 考试列表 | `GET /exam/studentexame/studentExameAction.do?ms=getExame` | 行内有 `gotoExame('16385289')` |
-| 进入考试/自测 | `GET .../studentExameAction.do?ms=beforeGotoExame&exameid=<id>&TimeStemp=<rand>` | 返回**第 1 页**试卷 HTML（计时从此开始） |
+| 进入考试/自测 | `GET .../studentExameAction.do?ms=beforeGotoExame&exameid=<id>&TimeStemp=<rand>` | 通常返回**第 1 页**试卷 HTML；部分考试会先返回确认页，需提交确认后再拿到试卷（计时从此开始） |
 | 保存并翻页 | `POST .../studentExameAction.do?ms=saveAnswerAndGetNextExameTheme` | 表单隐藏域 `exameid/pageNum/paperid/answerRealtimeId/answerRealtimeNum/userRealtimeId/fk_type/zc` + 答案字段；`pageNum` 填**目标页** |
 | 交卷 | `POST .../studentExameAction.do?ms=submitPaperComputeGrade` | 同上，把当前页答案一起带上 |
 | 题库浏览（院系/知识点） | `GET /exam/studenttest/studentTestAction.do?ms=gotoSearchTheme&knowid=<id>&deptId=<id>&pageNum=N&pageMax=20` | 每行给出**题干图片 URL + 正确答案**（`<font class="an">`） |
